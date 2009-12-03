@@ -1,0 +1,5 @@
+Python module for ganglia 3.1
+
+This module monitors nginx status via nginx stub_status.
+
+http://wiki.nginx.org/NginxHttpStubStatusModule

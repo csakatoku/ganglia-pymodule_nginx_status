@@ -1,251 +1,299 @@
-# -*- coding: utf-8 -*-
-import time
-import threading
-import re
-import urllib2
+###  This script reports nginx status stub metrics to ganglia.
+
+###  License to use, modify, and distribute under the GPL
+###  http://www.gnu.org/licenses/gpl.txt
+import logging
 import os
+import re
+import subprocess
+import sys
+import threading
+import time
+import traceback
+import urllib2
 
-# Worker thread object
-_WorkerThread = None
+logging.basicConfig(level=logging.ERROR, format="%(asctime)s - %(name)s - %(levelname)s\t Thread-%(thread)d - %(message)s", filename='/tmp/gmond.log', filemode='w')
+logging.debug('starting up')
 
-# Synchronization lock
-_glock = threading.Lock()
+_Worker_Thread = None
 
-# Refresh rate of the stub_status data
-_refresh_rate = 30
+class UpdateNginxThread(threading.Thread):
 
-# Global dictionary storing the counts of the last state
-_conns = {
-    'nginx_active_connections': 0,
-    'nginx_server_accepts'    : 0,
-    'nginx_server_handled'    : 0,
-    'nginx_server_requests'   : 0,
-    'nginx_reading'           : 0,
-    'nginx_writing'           : 0,
-    'nginx_waiting'           : 0,
-    }
-
-
-def nginx_stub_status(name):
-    global _WorkerThread
-
-    if _WorkerThread is None:
-        return 0
-
-    if not _WorkerThread.running and not _WorkerThread.shuttingdown:
-        _WorkerThread.start()
-
-    _glock.acquire()
-    ret = int(_conns[name])
-    _glock.release()
-
-    return ret
-
-
-# Metric descriptions
-_descriptors = [
-    { 'name'       : 'nginx_active_connections',
-      'call_back'  : nginx_stub_status,
-      'time_max'   : 20,
-      'value_type' : 'uint',
-      'units'      : 'Connections',
-      'slope'      : 'both',
-      'format'     : '%u',
-      'description': 'Number of all open connections including connections to backends',
-      'groups'     : 'nginx',
-      },
-
-    { 'name'       : 'nginx_server_accepts',
-      'call_back'  : nginx_stub_status,
-      'time_max'   : 20,
-      'value_type' : 'uint',
-      'units'      : 'Connections',
-      'slope'      : 'both',
-      'format'     : '%u',
-      'description': 'Total number of connections nginx accepts',
-      'groups'     : 'nginx',
-      },
-
-    { 'name'       : 'nginx_server_handled',
-      'call_back'  : nginx_stub_status,
-      'time_max'   : 20,
-      'value_type' : 'uint',
-      'units'      : 'Connections',
-      'slope'      : 'both',
-      'format'     : '%u',
-      'description': 'Total number of connections nginx handled',
-      'groups'     : 'nginx',
-      },
-
-    { 'name'       : 'nginx_server_requests',
-      'call_back'  : nginx_stub_status,
-      'time_max'   : 20,
-      'value_type' : 'uint',
-      'units'      : 'Requests',
-      'slope'      : 'both',
-      'format'     : '%u',
-      'description': 'Total number of requests nginx handles',
-      'groups'     : 'nginx',
-      },
-
-    { 'name'       : 'nginx_reading',
-      'call_back'  : nginx_stub_status,
-      'time_max'   : 20,
-      'value_type' : 'uint',
-      'units'      : 'Requests',
-      'slope'      : 'both',
-      'format'     : '%u',
-      'description': 'reading',
-      'groups'     : 'nginx',
-      },
-
-    { 'name'       : 'nginx_writing',
-      'call_back'  : nginx_stub_status,
-      'time_max'   : 20,
-      'value_type' : 'uint',
-      'units'      : 'Requests',
-      'slope'      : 'both',
-      'format'     : '%u',
-      'description': 'writing',
-      'groups'     : 'nginx',
-      },
-
-    { 'name'       : 'nginx_waiting',
-      'call_back'  : nginx_stub_status,
-      'time_max'   : 20,
-      'value_type' : 'uint',
-      'units'      : 'Requests',
-      'slope'      : 'both',
-      'format'     : '%u',
-      'description': 'waiting',
-      'groups'     : 'nginx',
-      },
-    ]
-
-
-class NginxThread(threading.Thread):
-    """
-    This thread continually gathers the current state of the nginx
-    on the machine via nginx stub_state module.
-    """
-
-    def __init__(self, url):
-        super(NginxThread, self).__init__()
+    def __init__(self, params):
+        threading.Thread.__init__(self)
         self.running = False
         self.shuttingdown = False
-        # the URL where stub_status is enabled
-        self.url = url
+        self.refresh_rate = int(params['refresh_rate'])
+        self.metrics = {}
+        self.settings = {}
+        self.status_url = params['status_url']
+        self.nginx_bin = params['nginx_bin']
+        self._metrics_lock = threading.Lock()
+        self._settings_lock = threading.Lock()
 
     def shutdown(self):
         self.shuttingdown = True
+        if not self.running:
+            return
         self.join()
 
     def run(self):
-        global _conns
+        global _Lock
 
-        #Set the state of the running thread
         self.running = True
 
-        # continue running until a shutdown event is indicated
         while not self.shuttingdown:
-            if self.shuttingdown:
-                break
+            time.sleep(self.refresh_rate)
+            self.refresh_metrics()
 
-            try:
-                res = urllib2.urlopen(self.url)
-            except urllib2.HTTPError, e:
-                time.sleep(_refresh_rate)
-                continue
-
-            if res.code != 200:
-                # error from nginx
-                pass
-
-            tempconn = dict([(k, 0) for k in _conns.keys()])
-
-            # Active connections
-            first = res.readline() or ''
-            matcher = re.match(r'Active connections: (\d+)', first)
-            if matcher:
-                tempconn['nginx_active_connections'] = int(matcher.group(1))
-
-            # server accepts handled requests
-            # discard this line
-            res.readline()
-
-            # actual data of server accepts, handled, requests
-            second = res.readline() or ''
-            matcher = re.match(r' (\d+) (\d+) (\d+)', second)
-            if matcher:
-                accepts, handled, requests = matcher.groups()
-                tempconn['nginx_server_accepts']  = int(accepts)
-                tempconn['nginx_server_handled']  = int(handled)
-                tempconn['nginx_server_requests'] = int(requests)
-
-            # Reading: 0 Writing: 1 Waiting: 0
-            third = res.readline() or ''
-            matcher = re.match(r'Reading: (\d+) Writing: (\d+) Waiting: (\d+)', third)
-            if matcher:
-                reading, writing, waiting = matcher.groups()
-                tempconn['nginx_reading'] = int(reading)
-                tempconn['nginx_writing'] = int(writing)
-                tempconn['nginx_waiting'] = int(waiting)
-
-            # acquire a lock and copy the temporary state
-            # to the global state dictionary
-            _glock.acquire()
-            for key, value in tempconn.items():
-                _conns[key] = value
-            _glock.release()
-
-            # wait for the refresh_rate period before collecting the status again
-            if not self.shuttingdown:
-                time.sleep(_refresh_rate)
-
-        # Set the current state of the thread after a shutdown has been indicated.
         self.running = False
 
+    @staticmethod
+    def _get_nginx_status_stub_response(url):
+        c = urllib2.urlopen(url)
+        data = c.read()
+        c.close()
+
+        matchActive = re.search(r'Active connections:\s+(\d+)', data)
+        matchHistory = re.search(r'\s*(\d+)\s+(\d+)\s+(\d+)', data)
+        matchCurrent = re.search(r'Reading:\s*(\d+)\s*Writing:\s*(\d+)\s*'
+            'Waiting:\s*(\d+)', data)
+
+        if not matchActive or not matchHistory or not matchCurrent:
+            raise Exception('Unable to parse {0}' . format(url))
+
+        result = {}
+        result['nginx_active_connections'] = int(matchActive.group(1))
+
+        result['nginx_accepts'] = int(matchHistory.group(1))
+        result['nginx_handled'] = int(matchHistory.group(2))
+        result['nginx_requests'] = int(matchHistory.group(3))
+
+        result['nginx_reading'] = int(matchCurrent.group(1))
+        result['nginx_writing'] = int(matchCurrent.group(2))
+        result['nginx_waiting'] = int(matchCurrent.group(3))
+
+        return result
+
+    def refresh_metrics(self):
+        logging.debug('refresh metrics')
+
+        try:
+            logging.debug(' opening URL: ' + str(self.status_url))
+
+            data = UpdateNginxThread._get_nginx_status_stub_response(self.status_url)
+        except:
+            logging.warning('error refreshing metrics')
+            logging.warning(traceback.print_exc(file=sys.stdout))
+
+        try:
+            self._metrics_lock.acquire()
+            self.metrics = {}
+
+            for k, v in data.items():
+                self.metrics[k] = v
+        except:
+            logging.warning('error refreshing metrics')
+            logging.warning(traceback.print_exc(file=sys.stdout))
+            return False
+        finally:
+            self._metrics_lock.release()
+
+        if not self.metrics:
+            logging.warning('error refreshing metrics')
+            return False
+
+        logging.debug('success refreshing metrics')
+        logging.debug('metrics: ' + str(self.metrics))
+
+        return True
+
+    def refresh_settings(self):
+        logging.debug(' refreshing server settings')
+
+        try:
+            p = subprocess.Popen(executable=self.nginx_bin, args=[self.nginx_bin, '-v'], shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            out, err = p.communicate()
+        except:
+            logging.warning('error refreshing settings')
+            return False
+
+        try:
+            self._settings_lock.acquire()
+            self.settings = {}
+            for line in err.split('\n'):
+                if line.startswith('nginx version:'):
+                    key = "nginx_server_version"
+                else:
+                    continue
+
+                logging.debug('  line: ' + str(line))
+
+                line = line.split(': ')
+
+                if len(line) > 1:
+                    self.settings[key] = line[1]
+        except:
+            logging.warning('error refreshing settings')
+            return False
+        finally:
+            self._settings_lock.release()
+
+        logging.debug('success refreshing server settings')
+        logging.debug('settings: ' + str(self.settings))
+
+        return True
+
+    def metric_of(self, name):
+        logging.debug('getting metric: ' + name)
+
+        try:
+            if name in self.metrics:
+                try:
+                    self._metrics_lock.acquire()
+                    logging.debug('metric: %s = %s' % (name, self.metrics[name]))
+                    return self.metrics[name]
+                finally:
+                    self._metrics_lock.release()
+        except:
+            logging.warning('failed to fetch ' + name)
+            return 0
+
+    def setting_of(self, name):
+        logging.debug('getting setting: ' + name)
+
+        try:
+            if name in self.settings:
+                try:
+                    self._settings_lock.acquire()
+                    logging.debug('setting: %s = %s' % (name, self.settings[name]))
+                    return self.settings[name]
+                finally:
+                    self._settings_lock.release()
+        except:
+            logging.warning('failed to fetch ' + name)
+            return 0
 
 def metric_init(params):
-    '''Initialize the tcp connection status module and create the
-    metric definition dictionary object for each metric.'''
-    global _refresh_rate, _WorkerThread
+    logging.debug('init: ' + str(params))
+    global _Worker_Thread
 
-    #Read the refresh from the gmond.conf parameters.
-    if 'refresh' in params:
-        try:
-            _refresh_rate = int(params['refresh'])
-        except (ValueError, TypeError):
-            _refresh_rate = 20
+    METRIC_DEFAULTS = {
+        'time_max': 60,
+        'units': 'connections',
+        'groups': 'nginx',
+        'slope': 'both',
+        'value_type': 'uint',
+        'format': '%d',
+        'description': '',
+        'call_back': metric_of
+    }
 
-    url = params.get('url')
+    descriptions = dict(
+        nginx_server_version={
+            'value_type': 'string',
+            'units': '',
+            'format': '%s',
+            'slope': 'zero',
+            'call_back': setting_of,
+            'description': 'Nginx version number'},
 
-    #Start the worker thread
-    _WorkerThread = NginxThread(url)
+        nginx_active_connections={
+            'description': 'Total number of active connections'},
 
-    #Return the metric descriptions to Gmond
-    return _descriptors
+        nginx_accepts={
+            'slope': 'positive',
+            'description': 'Total number of accepted connections'},
 
+        nginx_handled={
+            'slope': 'positive',
+            'description': 'Total number of handled connections'},
+
+        nginx_requests={
+            'slope': 'positive',
+            'units': 'requests',
+            'description': 'Total number of requests'},
+
+        nginx_reading={
+            'description': 'Current connection in the reading state'},
+
+        nginx_writing={
+            'description': 'Current connection in the writing state'},
+
+        nginx_waiting={
+            'description': 'Current connection in the waiting state'})
+
+    if _Worker_Thread is not None:
+        raise Exception('Worker thread already exists')
+
+    _Worker_Thread = UpdateNginxThread(params)
+    _Worker_Thread.refresh_metrics()
+    _Worker_Thread.refresh_settings()
+    _Worker_Thread.start()
+
+    descriptors = []
+
+    for name, desc in descriptions.iteritems():
+        d = desc.copy()
+        d['name'] = str(name)
+        [ d.setdefault(key, METRIC_DEFAULTS[key]) for key in METRIC_DEFAULTS.iterkeys() ]
+        descriptors.append(d)
+
+    return descriptors
+
+def metric_of(name):
+    global _Worker_Thread
+    return _Worker_Thread.metric_of(name)
+
+def setting_of(name):
+    global _Worker_Thread
+    return _Worker_Thread.setting_of(name)
 
 def metric_cleanup():
-    '''Clean up the metric module.'''
+    global _Worker_Thread
+    if _Worker_Thread is not None:
+        _Worker_Thread.shutdown()
+    logging.shutdown()
+    # pass
 
-    #Tell the worker thread to shutdown
-    _WorkerThread.shutdown()
-
-
-#This code is for debugging and unit testing
 if __name__ == '__main__':
+    from optparse import OptionParser
+
     try:
-        params = {'refresh': '20',
-                  'url'    : 'http://127.0.0.1/nginx_status',
-                  }
-        metric_init(params)
-        while 1:
-            for d in _descriptors:
-                v = d['call_back'](d['name'])
-                print 'value for %s is %u' % (d['name'],  v)
-            time.sleep(5)
+
+        logging.debug('running from cmd line')
+        parser = OptionParser()
+        parser.add_option('-u', '--URL', dest='status_url', default='http://localhost/nginx_status', help='URL for Nginx status stub page')
+        parser.add_option('--nginx-bin', dest='nginx_bin', default='/usr/sbin/nginx', help='path to nginx')
+        parser.add_option('-q', '--quiet', dest='quiet', action='store_true', default=False)
+        parser.add_option('-r', '--refresh-rate', dest='refresh_rate', default=15)
+        parser.add_option('-d', '--debug', dest='debug', action='store_true', default=False)
+
+        (options, args) = parser.parse_args()
+
+        descriptors = metric_init({
+            'status_url': options.status_url,
+            'nginx_bin': options.nginx_bin,
+            'refresh_rate': options.refresh_rate
+        })
+
+        if options.debug:
+            from pprint import pprint
+            pprint(descriptors)
+
+        for d in descriptors:
+            v = d['call_back'](d['name'])
+
+            if not options.quiet:
+                print ' {0}: {1} {2} [{3}]' . format(d['name'], v, d['units'], d['description'])
+
+        os._exit(1)
+
     except KeyboardInterrupt:
         time.sleep(0.2)
         os._exit(1)
+    except StandardError:
+        traceback.print_exc()
+        os._exit(1)
+    finally:
+        metric_cleanup()
